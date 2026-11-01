@@ -1,0 +1,296 @@
+"""Background jobs: reply polling (Phase 4). Ghosting/nudges added in Phase 5."""
+
+from __future__ import annotations
+
+import re
+from datetime import datetime, timezone
+
+from sqlalchemy import select
+
+from .config import settings
+from .db import SessionLocal
+from .models import Application, Contact, EmailDraft, ReplyEvent
+from .services import classify, drafting, gmail, llm, nudge, queueing
+from .services.discovery import chain as discovery_chain
+from .services.discovery import quota as discovery_quota
+
+# Stages we stop polling (definitive outcomes).
+TERMINAL_STAGES = {"rejection", "ghosted_dead", "duplicate_suppressed", "bounced"}
+# Headers that mark machine-generated mail (see classify.rule_label).
+_AUTO_HEADERS = ("Auto-Submitted", "X-Autoreply", "X-Autorespond", "Precedence")
+# Rank used so a later, lesser reply can't downgrade a better stage.
+STAGE_RANK = {"sent": 1, "recruiter_reply": 2, "interview_request": 3}
+
+
+_INTERN_WORDS = re.compile(r"\(?intern-to-fte\)?|\b(6[- ]month|internship|intern)\b", re.I)
+
+
+def _fulltime_role(target_role: str | None) -> str:
+    """The queued role reworded for a full-time ask.
+
+    Older queue entries carry internship titles ("ML Ranking Intern"); dropping
+    the internship words keeps the drafted role from contradicting itself.
+    """
+    role = _INTERN_WORDS.sub("", target_role or "")
+    role = re.sub(r"\(\s*\)", "", role)  # an emptied "(intern)" etc.
+    role = re.sub(r"\s{2,}", " ", role).strip(" -/,")
+    if not role:
+        return "Software Engineer or Backend Developer"
+    if not re.search(r"engineer|scientist|developer|analyst|researcher", role, re.I):
+        role = role.replace(" (", " Engineer (", 1) if " (" in role else f"{role} Engineer"
+    return role
+
+
+def _ms_to_dt(ms: str | int | None) -> datetime | None:
+    if not ms:
+        return None
+    return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc)
+
+
+def _apply_classification(app: Application, label: str, when: datetime | None) -> None:
+    if when:
+        app.last_contact_at = when
+    if label == "bounce":
+        app.stage = "bounced"  # dead address: stop polling and never nudge it
+        return
+    if label in ("other", "auto_reply"):
+        return  # an autoresponder isn't a human reply; the follow-up still applies
+    if label == "rejection":
+        app.stage = "rejection"  # definitive
+        return
+    # recruiter_reply / interview_request — never downgrade
+    if STAGE_RANK.get(label, 0) > STAGE_RANK.get(app.stage, 0):
+        app.stage = label
+
+
+def poll_replies() -> dict:
+    """Check every tracked thread for new inbound messages and classify them.
+
+    Returns a small summary dict (useful for the manual-trigger endpoint / logs).
+    """
+    db = SessionLocal()
+    summary = {
+        "threads_checked": 0, "new_replies": 0, "classify_errors": 0, "classifications": {}
+    }
+    try:
+        me = (gmail.get_profile().get("emailAddress") or "").lower()
+        apps = db.scalars(
+            select(Application).where(
+                Application.gmail_thread_id.is_not(None),
+                Application.stage.not_in(TERMINAL_STAGES),
+            )
+        ).all()
+
+        for app in apps:
+            summary["threads_checked"] += 1
+
+            # Messages we already know about: our own outbound + already-classified.
+            our_ids = set(
+                db.scalars(
+                    select(EmailDraft.gmail_message_id).where(
+                        EmailDraft.application_id == app.id,
+                        EmailDraft.gmail_message_id.is_not(None),
+                    )
+                ).all()
+            )
+            seen_ids = set(
+                db.scalars(
+                    select(ReplyEvent.gmail_message_id).where(
+                        ReplyEvent.application_id == app.id
+                    )
+                ).all()
+            )
+
+            if not app.gmail_thread_id:
+                continue
+
+            try:
+                messages = gmail.list_thread_messages(app.gmail_thread_id)
+            except Exception:  # noqa: BLE001 - a bad thread shouldn't kill the poll
+                continue
+
+            for msg in messages:  # Gmail returns oldest-first
+                mid = msg.get("id")
+                if mid in our_ids or mid in seen_ids:
+                    continue
+                sender = gmail.message_from(msg)
+                if me and me in sender.lower():
+                    continue  # our own message not tracked as a draft (edge case)
+
+                body = gmail.message_text(msg)
+                headers = {h.lower(): gmail.message_header(msg, h) for h in _AUTO_HEADERS}
+                label = classify.rule_label(sender, body, headers)
+                if label is None:
+                    try:
+                        label = classify.classify_reply(sender, body)["label"]
+                    except llm.BudgetExceeded:
+                        # Rules already filtered bounces and autoresponders, so this
+                        # is most likely a person. Keep it visible rather than
+                        # waiting for budget that won't return until the window rolls.
+                        label = "recruiter_reply"
+                        summary["budget_fallbacks"] = summary.get("budget_fallbacks", 0) + 1
+                    except Exception as e:  # noqa: BLE001
+                        # Leave it unrecorded so the next poll retries it; one LLM
+                        # failure (e.g. no credit) mustn't stop every other thread.
+                        summary["classify_errors"] += 1
+                        summary.setdefault("first_error", str(e)[:200])
+                        continue
+
+                db.add(
+                    ReplyEvent(
+                        application_id=app.id,
+                        gmail_message_id=mid,
+                        classification=label,
+                        snippet=(body[:300] or msg.get("snippet", "")),
+                    )
+                )
+                _apply_classification(app, label, _ms_to_dt(msg.get("internalDate")))
+
+                summary["new_replies"] += 1
+                summary["classifications"][label] = (
+                    summary["classifications"].get(label, 0) + 1
+                )
+
+            db.commit()
+        return summary
+    finally:
+        db.close()
+
+
+def daily_outreach(
+    limit: int | None = None,
+    min_priority: int | None = None,
+    max_priority: int | None = None,
+) -> dict:
+    """Work through the company queue: discover a contact, then stage a draft.
+
+    Runs on weekdays only (weekend cold email gets buried). This job NEVER sends
+    — every draft lands in 'pending' and still needs explicit approval.
+    """
+    db = SessionLocal()
+    limit = limit or settings.outreach_per_day
+    summary: dict = {
+        "attempted": 0, "drafted": 0, "no_contact": 0, "errors": [], "companies": []
+    }
+    try:
+        for company in queueing.next_batch(db, limit, min_priority, max_priority):
+            summary["attempted"] += 1
+
+            contact = db.scalar(
+                select(Contact)
+                .where(Contact.company_id == company.id)
+                .order_by(Contact.id.desc())
+            )
+
+            # 1. Discover a contact if we don't already have one.
+            if contact is None:
+                try:
+                    found = discovery_chain.discover_contact(company.domain or "")
+                except Exception as e:  # noqa: BLE001 - keep the batch going
+                    summary["errors"].append(f"{company.name}: discovery {e}"[:160])
+                    continue
+                if found is None:
+                    # Distinguish "genuinely unfindable" from "our metered
+                    # provider is out of quota". Marking the latter as skipped
+                    # would silently burn good companies that would resolve fine
+                    # once the quota resets, so leave them queued and stop the
+                    # batch rather than churning the whole list for nothing.
+                    if settings.hunter_enabled and discovery_quota.is_exhausted("hunter"):
+                        summary["deferred"] = summary.get("deferred", 0) + 1
+                        summary["companies"].append(
+                            {"company": company.name, "result": "deferred_quota"}
+                        )
+                        db.commit()
+                        break
+                    company.queue_status = "skipped"
+                    company.notes = ((company.notes or "") + " | no contact found").strip()
+                    db.commit()
+                    summary["no_contact"] += 1
+                    summary["companies"].append(
+                        {"company": company.name, "result": "no_contact"}
+                    )
+                    continue
+                contact = Contact(
+                    company_id=company.id,
+                    name=found.name,
+                    email=found.email,
+                    title=found.title,
+                    source=found.source,
+                    verified=found.verified,
+                )
+                db.add(contact)
+                db.commit()
+                db.refresh(contact)
+
+            # 2. Stage a personalized draft with the role-matched resume.
+            try:
+                app = drafting.ensure_application(
+                    db,
+                    company.id,
+                    f"Full-time {_fulltime_role(company.target_role)} (fresher / new grad)",
+                    contact_id=contact.id,
+                    resume_variant=company.resume_variant,
+                )
+                draft = drafting.generate_draft_for_application(db, app)
+            except Exception as e:  # noqa: BLE001
+                db.rollback()
+                summary["errors"].append(f"{company.name}: draft {e}"[:160])
+                if isinstance(e, llm.BudgetExceeded) or "insufficient_quota" in str(e):
+                    # Out of budget or OpenAI credit: every remaining draft would
+                    # fail too. Stop; these companies stay queued for next run.
+                    summary["stopped"] = (
+                        "llm_budget_exceeded" if isinstance(e, llm.BudgetExceeded)
+                        else "openai_out_of_credit"
+                    )
+                    break
+                continue
+
+            company.queue_status = "done"
+            db.commit()
+            summary["drafted"] += 1
+            summary["companies"].append(
+                {
+                    "company": company.name,
+                    "result": "drafted",
+                    "draft_id": draft.id,
+                    "to": contact.email,
+                    "resume_variant": app.resume_variant,
+                }
+            )
+        # job_log keeps only scalar fields, so surface the errors as scalars too.
+        summary["error_count"] = len(summary["errors"])
+        if summary["errors"]:
+            summary["first_error"] = summary["errors"][0]
+        return summary
+    finally:
+        db.close()
+
+
+def check_ghosting() -> dict:
+    """Daily sweep: stage nudge drafts for silent applications, mark dead ones.
+
+    Only ever *stages* drafts for approval — this job never sends anything.
+    """
+    db = SessionLocal()
+    summary: dict = {"checked": 0, "actions": {}}
+    try:
+        apps = db.scalars(
+            select(Application).where(
+                Application.stage == "sent",
+                Application.sent_at.is_not(None),
+            )
+        ).all()
+        for app in apps:
+            summary["checked"] += 1
+            try:
+                action = nudge.process_application(db, app)
+            except Exception as e:  # noqa: BLE001 - one bad app shouldn't kill the sweep
+                db.rollback()
+                summary["actions"][f"error:{app.id}"] = str(e)[:120]
+                continue
+            if action:
+                summary["actions"][action] = summary["actions"].get(action, 0) + 1
+            db.commit()
+        return summary
+    finally:
+        db.close()

@@ -1,0 +1,45 @@
+# Secrets & credentials — never commit
+.env
+backend/.env
+token.json
+credentials.json
+backend/credentials.json
+client_secret*.json
+backend/client_secret*.json
+
+# Databases
+*.db
+*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node
+node_modules/
+frontend/dist/
+
+# Personal documents
+assets/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+
+# Local tooling
+.claude/
+CLAUDE.md
+quota_state.json
+backend/quota_state.json
+job_runs.json
+backend/job_runs.json
+token.json.dead
+backend/token.json.dead
+token.json*
+backend/token.json*
+bulk_send_schedule.json
+backend/bulk_send_schedule.json
+llm_spend.json
+backend/llm_spend.json
